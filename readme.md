@@ -1,5 +1,7 @@
 # ChromaGuard Pro: Advanced Invisible Watermarking
 
+![web page](https://github.com/IyenshiAUT/ChromeGuard-Pro/blob/main/images/Screenshot%202025-06-23%20080949.png)
+
 Welcome to **ChromaGuard Pro**, a complete, self-contained web application that allows users to embed and extract robust, invisible watermarks in images using a state-of-the-art algorithm.
 
 This application combines a sophisticated, full-frame DWT-SVD watermarking method with a layer of AES encryption for high security. The entire project is served through a user-friendly web interface powered by a single Python script running a Flask server. It also includes a unique module for simulating common image attacks to test the resilience of the embedded watermark.
