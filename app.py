@@ -19,13 +19,23 @@ import cv2
 from watermarker import Watermarker
 from utils import Crypto, Config
 
-# Initialize Flask application with template folder
+
 app = Flask(__name__, template_folder='templates')
+
+# Initialize Flask application with template folder
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
+
+# Increase upload size limit to 32MB
 
 # Create a global watermarker instance for processing
 watermarker = Watermarker()
 
 # --- Flask API Endpoints ---
+
+# JSON handler for 413 Request Entity Too Large
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'File too large', 'code': 413}), 413
 
 @app.route('/')
 def home():
@@ -114,9 +124,14 @@ def extract_endpoint():
         return jsonify({'error': "Missing image or keys"}), 400
     
     try:
+        file = request.files['image']
+        file_bytes = file.read()
+        print('Extract file size:', len(file_bytes))
+        file.seek(0)  # Reset file pointer after reading
+
         # Extract watermark using the watermarker
         extracted_text = watermarker.extract(
-            request.files['image'].read(), 
+            file_bytes, 
             json.loads(request.form['keys'])
         )
         return jsonify({'text': extracted_text})
@@ -228,6 +243,21 @@ def attack_endpoint():
         return jsonify({'error': str(e)}), 500
 
 # Main entry point for the Flask application
-if __name__ == '__main__':
-    # Run the Flask app in debug mode on port 5000
-    app.run(debug=True, port=5000)
+if __name__ == "__main__":
+    # The app is now intended to be run via a proper ASGI server like Uvicorn
+    # Example: uvicorn asgi:asgi_app --reload
+    print("Starting the Flask application.")
+    print("To run the server, use the command: uvicorn asgi:asgi_app --reload")
+    # The following is a fallback for direct execution, but Uvicorn is preferred.
+    try:
+        import uvicorn
+        # Note: Running directly like this is not the standard way.
+        # It's better to use the command line `uvicorn asgi:asgi_app`.
+        uvicorn.run("asgi:asgi_app", host="127.0.0.1", port=5000, log_level="info", reload=True)
+    except ImportError:
+        print("Uvicorn not found. Falling back to Flask's built-in development server.")
+        app.run(debug=True, port=5000)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        print("Falling back to Flask's built-in development server.")
+        app.run(debug=True, port=5000)

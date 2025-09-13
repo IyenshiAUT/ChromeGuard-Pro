@@ -34,12 +34,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const coverImageInput = document.getElementById('cover-image-input');
     const extractImageInput = document.getElementById('extract-image-input');
     
-    // Store watermarked image blob for attack simulation
+    // Store watermarked image blob for attack simulation and extraction
     let watermarkedImageBlob = null;
+    let attackedImageBlob = null; // Will hold the blob after an attack
 
     // Add event listeners for file input changes
     coverImageInput.addEventListener('change', () => updateFileLabel('cover-image-input', 'cover-image-label'));
-    extractImageInput.addEventListener('change', () => updateFileLabel('extract-image-input', 'extract-image-label'));
+    extractImageInput.addEventListener('change', () => {
+        updateFileLabel('extract-image-input', 'extract-image-label');
+        // If user manually selects a file, clear the attacked image blob
+        attackedImageBlob = null; 
+    });
 
     // Watermark embedding form submission
     embedForm.addEventListener('submit', async (e) => {
@@ -84,6 +89,7 @@ document.addEventListener('DOMContentLoaded', () => {
             watermarkedImageBlob = await imageResponse.blob();
             document.getElementById('attack-section').classList.remove('hidden');
             document.getElementById('attack-output').classList.add('hidden');
+            attackedImageBlob = null; // Reset attacked blob on new embed
         } catch (error) {
             alert(`Error: ${error.message}`);
         } finally {
@@ -99,7 +105,17 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Prepare form data for extraction
         const formData = new FormData();
-        formData.append('image', extractImageInput.files[0]);
+        
+        // IMPORTANT: Use the attacked image blob if it exists, otherwise use the file from the input.
+        if (attackedImageBlob) {
+            formData.append('image', attackedImageBlob, 'attacked_image.png');
+        } else if (extractImageInput.files.length > 0) {
+            formData.append('image', extractImageInput.files[0]);
+        } else {
+            alert('Please select an image for extraction.');
+            return;
+        }
+        
         formData.append('keys', document.getElementById('keys-input').value);
         
         // Update UI state
@@ -191,17 +207,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 throw new Error(errorData.error || 'Attack failed.'); 
             }
             
-            // Display attacked image
-            const attackedBlob = await response.blob();
-            document.getElementById('attacked-image-display').src = URL.createObjectURL(attackedBlob);
+            // Display attacked image and STORE the blob
+            attackedImageBlob = await response.blob(); // Store the blob in our variable
+            document.getElementById('attacked-image-display').src = URL.createObjectURL(attackedImageBlob);
             document.getElementById('attack-output').classList.remove('hidden');
             
             // Setup button to send attacked image to extraction
             document.getElementById('send-to-extract-btn').onclick = () => {
-                const dataTransfer = new DataTransfer();
-                dataTransfer.items.add(new File([attackedBlob], 'attacked_image.png', { type: 'image/png' }));
-                extractImageInput.files = dataTransfer.files;
-                updateFileLabel('extract-image-input', 'extract-image-label');
+                // Clear the file input visually and logically
+                extractImageInput.value = ''; 
+                // Update the label to show we're using the attacked image
+                const extractLabel = document.getElementById('extract-image-label');
+                extractLabel.innerHTML = `<svg class="icon text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> <span>Using attacked image</span>`;
+                // Scroll to the extraction form
                 document.getElementById('keys-input').scrollIntoView({ behavior: 'smooth' });
             };
         } catch (error) {
@@ -212,4 +230,4 @@ document.addEventListener('DOMContentLoaded', () => {
             hideSpinner('attack-spinner');
         }
     });
-}); 
+});

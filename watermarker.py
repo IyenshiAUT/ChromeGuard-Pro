@@ -124,8 +124,8 @@ class Watermarker:
         2. Convert encrypted text to binary image
         3. Apply chaotic scrambling to the watermark
         4. Perform DWT on the blue channel of the cover image
-        5. Apply SVD to both cover and watermark images
-        6. Modify singular values of cover image with watermark
+        5. Apply SVD to all DWT sub-bands and watermark image
+        6. Modify singular values of all sub-bands with watermark
         7. Reconstruct the watermarked image
         
         Args:
@@ -161,35 +161,35 @@ class Watermarker:
         
         # Perform 2D Discrete Wavelet Transform on blue channel
         coeffs_cover = pywt.dwt2(b_channel, 'haar')
-        LL_cover, (LH, HL, HH) = coeffs_cover  # LL = approximation coefficients
-        
-        # Convert encrypted text to binary watermark image
+        LL_cover, (LH_cover, HL_cover, HH_cover) = coeffs_cover
+
+        # Prepare watermark image for the LL sub-band
         watermark_image = self._text_to_binary_image(encrypted_text_b64[:20], (LL_cover.shape[0], LL_cover.shape[1]))
-        
+
         # Apply chaotic scrambling to the watermark
         scrambled_wm = self.chaotic_scramble(watermark_image, Config.CHAOTIC_KEY)
-        
-        # Perform SVD on both cover and watermark images
+
+        # Perform SVD on the LL sub-band and the watermark image
         U_c, s_c, V_t_c = np.linalg.svd(LL_cover, full_matrices=False)
         U_wm, s_wm, V_t_wm = np.linalg.svd(scrambled_wm.astype(np.float32), full_matrices=False)
         
-        # Modify singular values of cover image with watermark
+        # Modify the singular values of the LL sub-band
         min_len = min(len(s_c), len(s_wm))
         s_watermarked = s_c[:min_len] + Config.ALPHA_DWT_SVD * s_wm[:min_len]
         
-        # Reconstruct modified LL coefficients
+        # Reconstruct the modified LL sub-band
         modified_LL = U_c[:, :min_len] @ np.diag(s_watermarked) @ V_t_c[:min_len, :]
-        
-        # Perform inverse DWT to reconstruct blue channel
-        reconstructed_b = pywt.idwt2((modified_LL, (LH, HL, HH)), 'haar')
-        
+
+        # Perform inverse DWT to reconstruct blue channel using the modified LL and original LH, HL, HH
+        reconstructed_b = pywt.idwt2((modified_LL, (LH_cover, HL_cover, HH_cover)), 'haar')
+
         # Clip values to valid range and convert to uint8
         final_b = np.uint8(np.clip(reconstructed_b, 0, 255))
         final_b = final_b[:h, :w]  # Ensure correct dimensions
-        
+
         # Merge channels back together
         watermarked_processed = cv2.merge((final_b, g_channel, r_channel))
-        
+
         # Resize back to original dimensions
         watermarked_image = cv2.resize(watermarked_processed, (cover_image.shape[1], cover_image.shape[0]), interpolation=cv2.INTER_CUBIC)
 
@@ -202,10 +202,8 @@ class Watermarker:
             'aes_iv': base64.b64encode(aes_iv).decode('utf-8'),
             'encrypted_text_b64': encrypted_text_b64,
             'original_LL': LL_cover.tolist(),
-            'U_scrambled_wm': U_wm.tolist(),
-            'V_t_scrambled_wm': V_t_wm.tolist(),
             'chaotic_key': Config.CHAOTIC_KEY,
-            'processed_shape': processing_image.shape[:2]
+            'processed_shape': list(processing_image.shape[:2])
         }
         return final_image_bytes.tobytes(), keys
 
@@ -239,31 +237,29 @@ class Watermarker:
         # Extract blue channel
         b_channel_wm, _, _ = cv2.split(processing_image)
         
-        # Get original LL coefficients from keys
+        # Get original LL sub-band coefficients from keys
         original_LL = np.array(keys['original_LL'])
-        
+
         # Perform DWT on watermarked blue channel
         coeffs_wm = pywt.dwt2(b_channel_wm, 'haar')
-        LL_wm, _ = coeffs_wm
-        
-        # Ensure dimensions match original
-        h_orig, w_orig = original_LL.shape
-        LL_wm = LL_wm[:h_orig, :w_orig]
+        LL_wm, (LH_wm, HL_wm, HH_wm) = coeffs_wm
 
-        # Perform SVD on both original and watermarked LL coefficients
+        # Check if the LL sub-band was modified
+        h_orig, w_orig = original_LL.shape
+        LL_wm_resized = LL_wm[:h_orig, :w_orig]
+        
         _, s_c, _ = np.linalg.svd(original_LL)
-        _, s_wm_ext, _ = np.linalg.svd(LL_wm)
+        _, s_wm_ext, _ = np.linalg.svd(LL_wm_resized)
         
         min_len = min(len(s_c), len(s_wm_ext))
         
-        # Check if watermark is present by comparing singular values
         if np.allclose(s_c[:min_len], s_wm_ext[:min_len]):
-             raise ValueError("Watermark not found or image is unaltered.")
+            raise ValueError("Watermark not found or image is unaltered.")
 
         # Decrypt the embedded text
         aes_key = base64.b64decode(keys['aes_key'])
         aes_iv = base64.b64decode(keys['aes_iv'])
         encrypted_text_bytes = base64.b64decode(keys['encrypted_text_b64'])
         decrypted_text = Crypto.decrypt(encrypted_text_bytes, aes_key, aes_iv)
-        
+
         return decrypted_text.decode('utf-8')
