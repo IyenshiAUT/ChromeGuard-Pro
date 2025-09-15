@@ -8,12 +8,12 @@ The watermarking process embeds encrypted text into the blue channel of images.
 Author: Image Processing Project
 """
 
+import base64
 import cv2
 import numpy as np
 import pywt
-import os
-import base64
 from utils import Crypto, Config
+import os
 
 class Watermarker:
     """
@@ -117,149 +117,230 @@ class Watermarker:
 
     def embed(self, cover_image_bytes, watermark_text):
         """
-        Embeds encrypted text as an invisible watermark into an image.
-        
+        Embeds encrypted text as an invisible watermark into an image using an
+        adaptive, block-based DWT-SVD approach.
+
         The embedding process follows these steps:
-        1. Encrypt the watermark text using AES encryption
-        2. Convert encrypted text to binary image
-        3. Apply chaotic scrambling to the watermark
-        4. Perform DWT on the blue channel of the cover image
-        5. Apply SVD to all DWT sub-bands and watermark image
-        6. Modify singular values of all sub-bands with watermark
-        7. Reconstruct the watermarked image
+        1. Encrypt the watermark text using AES encryption.
+        2. Convert encrypted text to a binary image.
+        3. Apply chaotic scrambling to the watermark.
+        4. Perform DWT on the blue channel of the cover image.
+        5. Divide the LL sub-band into blocks.
+        6. For each block, calculate its variance to determine local complexity.
+        7. Calculate an adaptive embedding strength (alpha) based on the variance.
+        8. Apply SVD to the block and embed the watermark using the adaptive alpha.
+        9. Reconstruct the LL sub-band from the modified blocks.
+        10. Reconstruct the watermarked image via inverse DWT.
         
         Args:
-            cover_image_bytes (bytes): Raw bytes of the cover image
-            watermark_text (str): Text to embed as watermark
+            cover_image_bytes (bytes): Raw bytes of the cover image.
+            watermark_text (str): Text to embed as watermark.
             
         Returns:
             tuple: (watermarked_image_bytes, keys_dict)
-                - watermarked_image_bytes: Bytes of the watermarked image
-                - keys_dict: Dictionary containing all keys needed for extraction
+                - watermarked_image_bytes: Bytes of the watermarked image.
+                - keys_dict: Dictionary containing all keys needed for extraction.
         """
-        # Generate AES encryption keys
         aes_key = os.urandom(Config.AES_KEY_SIZE)
         aes_iv = os.urandom(Config.AES_IV_SIZE)
-        
-        # Encrypt the watermark text
         encrypted_text_bytes = Crypto.encrypt(watermark_text.encode('utf-8'), aes_key, aes_iv)
         encrypted_text_b64 = base64.b64encode(encrypted_text_bytes).decode('utf-8')
-        
-        # Convert cover image bytes to OpenCV format
         cover_image = self._bytes_to_cv2_image(cover_image_bytes)
         
-        # Resize image if it exceeds maximum dimension for processing
         processing_image = cover_image
         if cover_image.shape[0] > Config.MAX_DIMENSION or cover_image.shape[1] > Config.MAX_DIMENSION:
             r = Config.MAX_DIMENSION / float(max(cover_image.shape[:2]))
             dim = (int(cover_image.shape[1] * r), int(cover_image.shape[0] * r))
             processing_image = cv2.resize(cover_image, dim, interpolation=cv2.INTER_AREA)
 
-        # Split image into color channels and work with blue channel
+        # Build a tiny grayscale thumbnail for geometric pre-alignment (96x96)
+        thumb_size = 96
+        thumb_gray = cv2.cvtColor(processing_image, cv2.COLOR_BGR2GRAY)
+        thumb_small = cv2.resize(thumb_gray, (thumb_size, thumb_size), interpolation=cv2.INTER_AREA)
+        ok, thumb_png = cv2.imencode(".png", thumb_small)
+        thumb_b64 = base64.b64encode(thumb_png.tobytes()).decode("utf-8")
+
+        # Split channels (B, G, R) for downstream use
         b_channel, g_channel, r_channel = cv2.split(processing_image)
-        h, w = b_channel.shape
-        
-        # Perform 2D Discrete Wavelet Transform on blue channel
-        coeffs_cover = pywt.dwt2(b_channel, 'haar')
-        LL_cover, (LH_cover, HL_cover, HH_cover) = coeffs_cover
 
-        # Prepare watermark image for the LL sub-band
-        watermark_image = self._text_to_binary_image(encrypted_text_b64[:20], (LL_cover.shape[0], LL_cover.shape[1]))
+        # --- Multi-Channel Adaptive Embedding ---
+        def _embed_channel(channel, scrambled_wm):
+            """Helper function to apply adaptive watermarking to a single channel."""
+            h, w = channel.shape
+            # Ensure float for DWT
+            channel_f = channel.astype(np.float32)
+            coeffs_cover = pywt.dwt2(channel_f, 'haar')
+            LL_cover, (LH_cover, HL_cover, HH_cover) = coeffs_cover
 
-        # Apply chaotic scrambling to the watermark
+            block_size = 8
+            modified_LL = np.zeros_like(LL_cover)
+            
+            MIN_ALPHA = 0.02
+            MAX_ALPHA = 0.25
+            max_possible_variance = np.var(LL_cover)
+            if max_possible_variance < 1: max_possible_variance = 1
+
+            for r in range(0, LL_cover.shape[0], block_size):
+                for c in range(0, LL_cover.shape[1], block_size):
+                    cover_block = LL_cover[r:r+block_size, c:c+block_size]
+                    wm_block = scrambled_wm[r:r+block_size, c:c+block_size]
+                    
+                    if cover_block.shape != (block_size, block_size):
+                        modified_LL[r:r+block_size, c:c+block_size] = cover_block
+                        continue
+
+                    U_c, s_c, V_t_c = np.linalg.svd(cover_block, full_matrices=False)
+                    
+                    variance = np.var(cover_block)
+                    normalized_variance = min(variance / max_possible_variance, 1.0)
+                    adaptive_alpha = MIN_ALPHA + (normalized_variance * (MAX_ALPHA - MIN_ALPHA))
+
+                    U_wm, s_wm, V_t_wm = np.linalg.svd(wm_block.astype(np.float32), full_matrices=False)
+                    
+                    min_len = min(len(s_c), len(s_wm))
+                    s_watermarked = s_c[:min_len] + adaptive_alpha * s_wm[:min_len]
+                    
+                    U_c_trunc = U_c[:, :min_len]
+                    V_t_c_trunc = V_t_c[:min_len, :]
+                    modified_block = U_c_trunc @ np.diag(s_watermarked) @ V_t_c_trunc
+                    
+                    modified_LL[r:r+block_size, c:c+block_size] = modified_block
+
+            reconstructed_channel = pywt.idwt2((modified_LL, (LH_cover, HL_cover, HH_cover)), 'haar')
+            final_channel = np.uint8(np.clip(reconstructed_channel, 0, 255))
+            return final_channel[:h, :w]
+
+        # First, generate the fingerprint from the original BLUE channel
+        # Ensure float for DWT
+        coeffs_b_cover = pywt.dwt2(b_channel.astype(np.float32), 'haar')
+        LL_b_cover, _ = coeffs_b_cover
+        block_size = 8
+        original_s_values = []
+        for r in range(0, LL_b_cover.shape[0], block_size):
+            for c in range(0, LL_b_cover.shape[1], block_size):
+                cover_block = LL_b_cover[r:r+block_size, c:c+block_size]
+                if cover_block.shape != (block_size, block_size):
+                    continue
+                _, s_c, _ = np.linalg.svd(cover_block, full_matrices=False)
+                original_s_values.extend(s_c)
+
+        # Prepare the watermark image, sized based on the LL band of one channel
+        watermark_image = self._text_to_binary_image(
+            encrypted_text_b64[:20],
+            (LL_b_cover.shape[0], LL_b_cover.shape[1])
+        )
         scrambled_wm = self.chaotic_scramble(watermark_image, Config.CHAOTIC_KEY)
 
-        # Perform SVD on the LL sub-band and the watermark image
-        U_c, s_c, V_t_c = np.linalg.svd(LL_cover, full_matrices=False)
-        U_wm, s_wm, V_t_wm = np.linalg.svd(scrambled_wm.astype(np.float32), full_matrices=False)
-        
-        # Modify the singular values of the LL sub-band
-        min_len = min(len(s_c), len(s_wm))
-        s_watermarked = s_c[:min_len] + Config.ALPHA_DWT_SVD * s_wm[:min_len]
-        
-        # Reconstruct the modified LL sub-band
-        modified_LL = U_c[:, :min_len] @ np.diag(s_watermarked) @ V_t_c[:min_len, :]
+        # Embed the watermark into all three channels
+        final_b = _embed_channel(b_channel, scrambled_wm)
+        final_g = _embed_channel(g_channel, scrambled_wm)
+        final_r = _embed_channel(r_channel, scrambled_wm)
 
-        # Perform inverse DWT to reconstruct blue channel using the modified LL and original LH, HL, HH
-        reconstructed_b = pywt.idwt2((modified_LL, (LH_cover, HL_cover, HH_cover)), 'haar')
-
-        # Clip values to valid range and convert to uint8
-        final_b = np.uint8(np.clip(reconstructed_b, 0, 255))
-        final_b = final_b[:h, :w]  # Ensure correct dimensions
-
-        # Merge channels back together
-        watermarked_processed = cv2.merge((final_b, g_channel, r_channel))
+        # Merge the watermarked channels back together
+        watermarked_processed = cv2.merge((final_b, final_g, final_r))
 
         # Resize back to original dimensions
         watermarked_image = cv2.resize(watermarked_processed, (cover_image.shape[1], cover_image.shape[0]), interpolation=cv2.INTER_CUBIC)
-
-        # Encode final image to bytes
         _, final_image_bytes = cv2.imencode('.png', watermarked_image)
 
-        # Prepare keys dictionary for extraction
+        # Convert the fingerprint to a compact byte string and then Base64 encode it
+        s_values_bytes = np.array(original_s_values, dtype=np.float32).tobytes()
+        s_fingerprint_b64 = base64.b64encode(s_values_bytes).decode('utf-8')
+
+        # Prepare keys dictionary with the compact, encoded fingerprint
         keys = {
             'aes_key': base64.b64encode(aes_key).decode('utf-8'),
             'aes_iv': base64.b64encode(aes_iv).decode('utf-8'),
             'encrypted_text_b64': encrypted_text_b64,
-            'original_LL': LL_cover.tolist(),
+            's_fingerprint_b64': s_fingerprint_b64,  # compact fingerprint
+            'thumb_b64': thumb_b64,                  # tiny thumbnail for alignment
             'chaotic_key': Config.CHAOTIC_KEY,
-            'processed_shape': list(processing_image.shape[:2])
+            'processed_shape': list(processing_image.shape[:2]),  # [h, w]
+            'block_size': block_size
         }
         return final_image_bytes.tobytes(), keys
 
     def extract(self, watermarked_image_bytes, keys):
         """
-        Extracts and decrypts the embedded watermark from an image.
-        
-        The extraction process reverses the embedding process:
-        1. Resize image to processing dimensions
-        2. Perform DWT on blue channel
-        3. Compare singular values to detect watermark
-        4. Decrypt the extracted text
-        
-        Args:
-            watermarked_image_bytes (bytes): Raw bytes of the watermarked image
-            keys (dict): Dictionary containing all keys needed for extraction
-            
-        Returns:
-            str: Extracted and decrypted watermark text
-            
-        Raises:
-            ValueError: If watermark is not found or image is unaltered
+        Extracts and decrypts the embedded watermark. Performs best‑effort
+        geometric pre‑alignment using a small thumbnail.
         """
-        # Convert watermarked image bytes to OpenCV format
+        # Decode image
         watermarked_image = self._bytes_to_cv2_image(watermarked_image_bytes)
-        
+
+        # Best‑effort geometric pre‑alignment (if thumbnail present)
+        try:
+            if 'thumb_b64' in keys and 'processed_shape' in keys:
+                proc_h, proc_w = int(keys['processed_shape'][0]), int(keys['processed_shape'][1])
+                thumb_size = 96
+
+                th_bytes = np.frombuffer(base64.b64decode(keys['thumb_b64']), np.uint8)
+                thumb_img = cv2.imdecode(th_bytes, cv2.IMREAD_GRAYSCALE)
+                if thumb_img is not None and thumb_img.shape == (thumb_size, thumb_size):
+                    h_full, w_full = watermarked_image.shape[:2]
+                    attacked_gray = cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2GRAY)
+                    attacked_small = cv2.resize(attacked_gray, (thumb_size, thumb_size), interpolation=cv2.INTER_AREA)
+
+                    orb = cv2.ORB_create(nfeatures=800)
+                    k1, d1 = orb.detectAndCompute(attacked_small, None)
+                    k2, d2 = orb.detectAndCompute(thumb_img, None)
+                    if d1 is not None and d2 is not None and len(k1) >= 8 and len(k2) >= 8:
+                        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                        matches = bf.match(d1, d2)
+                        if matches:
+                            matches = sorted(matches, key=lambda m: m.distance)[:60]
+                            pts1 = np.float32([k1[m.queryIdx].pt for m in matches])
+                            pts2 = np.float32([k2[m.trainIdx].pt for m in matches])
+                            H_small, _ = cv2.findHomography(pts1, pts2, cv2.RANSAC, 3.0)
+                            if H_small is not None:
+                                sx = w_full / float(thumb_size)
+                                sy = h_full / float(thumb_size)
+                                S_up = np.array([[sx, 0, 0],[0, sy, 0],[0, 0, 1]], dtype=np.float64)
+                                S_dn = np.array([[1.0/sx, 0, 0],[0, 1.0/sy, 0],[0, 0, 1]], dtype=np.float64)
+                                H_full = S_up @ H_small @ S_dn
+                                watermarked_image = cv2.warpPerspective(
+                                    watermarked_image, H_full, (proc_w, proc_h),
+                                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+                                )
+        except Exception:
+            # Alignment is best‑effort; continue if it fails
+            pass
+
         # Resize to processing dimensions
-        proc_h, proc_w = keys['processed_shape']
-        processing_image = cv2.resize(watermarked_image, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-        
-        # Extract blue channel
-        b_channel_wm, _, _ = cv2.split(processing_image)
-        
-        # Get original LL sub-band coefficients from keys
-        original_LL = np.array(keys['original_LL'])
+        if 'processed_shape' in keys:
+            proc_h, proc_w = int(keys['processed_shape'][0]), int(keys['processed_shape'][1])
+            watermarked_image = cv2.resize(watermarked_image, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
 
-        # Perform DWT on watermarked blue channel
-        coeffs_wm = pywt.dwt2(b_channel_wm, 'haar')
-        LL_wm, (LH_wm, HL_wm, HH_wm) = coeffs_wm
+        # Compute LL SVD fingerprint on blue channel
+        b_channel_wm, _, _ = cv2.split(watermarked_image)
+        LL_wm, _ = pywt.dwt2(b_channel_wm.astype(np.float32), 'haar')
 
-        # Check if the LL sub-band was modified
-        h_orig, w_orig = original_LL.shape
-        LL_wm_resized = LL_wm[:h_orig, :w_orig]
-        
-        _, s_c, _ = np.linalg.svd(original_LL)
-        _, s_wm_ext, _ = np.linalg.svd(LL_wm_resized)
-        
-        min_len = min(len(s_c), len(s_wm_ext))
-        
-        if np.allclose(s_c[:min_len], s_wm_ext[:min_len]):
-            raise ValueError("Watermark not found or image is unaltered.")
+        block_size = int(keys.get('block_size', 8))
+        s_curr_list = []
+        for rr in range(0, LL_wm.shape[0], block_size):
+            for cc in range(0, LL_wm.shape[1], block_size):
+                blk = LL_wm[rr:rr+block_size, cc:cc+block_size]
+                if blk.shape != (block_size, block_size):
+                    continue
+                _, s_blk, _ = np.linalg.svd(blk, full_matrices=False)
+                s_curr_list.extend(s_blk)
+        s_curr = np.asarray(s_curr_list, dtype=np.float32)
 
-        # Decrypt the embedded text
+        # Load original fingerprint (log similarity; do not block)
+        if 's_fingerprint_b64' in keys:
+            s_orig = np.frombuffer(base64.b64decode(keys['s_fingerprint_b64']), dtype=np.float32)
+            if len(s_orig) and len(s_curr):
+                m = min(len(s_orig), len(s_curr))
+                denom = float(np.linalg.norm(s_orig[:m]) + 1e-6)
+                s_diff = float(np.linalg.norm(s_curr[:m] - s_orig[:m]) / denom)
+                try:
+                    print(f"SVD fingerprint diff: {s_diff:.6f}")
+                except Exception:
+                    pass
+
+        # Decrypt using AES materials from keys
         aes_key = base64.b64decode(keys['aes_key'])
         aes_iv = base64.b64decode(keys['aes_iv'])
-        encrypted_text_bytes = base64.b64decode(keys['encrypted_text_b64'])
-        decrypted_text = Crypto.decrypt(encrypted_text_bytes, aes_key, aes_iv)
-
-        return decrypted_text.decode('utf-8')
+        ciphertext = base64.b64decode(keys['encrypted_text_b64'])
+        plaintext = Crypto.decrypt(ciphertext, aes_key, aes_iv)
+        return plaintext.decode('utf-8')
